@@ -1,139 +1,316 @@
 package tbot
 
 import (
+	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
-
-	"github.com/yanzay/tbot/internal/adapter"
-	"github.com/yanzay/tbot/model"
+	"net/url"
+	"regexp"
+	"time"
 )
 
-// Server is a telegram bot server. Looks and feels like net/http.
+var (
+	apiBaseURL = "https://api.telegram.org"
+)
+
+// Server will connect and serve all updates from Telegram
 type Server struct {
-	mux         Mux
-	httpClient  *http.Client
+	webhookURL    string
+	listenAddr    string
+	httpClient    *http.Client
+	client        *Client
+	token         string
+	logger        Logger
+	stop          chan struct{}
+	updatesParams url.Values
+	bufferSize    int
+	nextOffset    int
+
+	messageHandlers        []messageHandler
+	editMessageHandler     handlerFunc
+	channelPostHandler     handlerFunc
+	editChannelPostHandler handlerFunc
+	inlineQueryHandler     func(*InlineQuery)
+	inlineResultHandler    func(*ChosenInlineResult)
+	callbackHandler        func(*CallbackQuery)
+	shippingHandler        func(*ShippingQuery)
+	preCheckoutHandler     func(*PreCheckoutQuery)
+	pollHandler            func(*Poll)
+
 	middlewares []Middleware
-	webhookURL  string
-	listenAddr  string
-	bot         adapter.BotAdapter
 }
 
-// Middleware function takes HandlerFunction and returns HandlerFunction.
-// Should call it's argument function inside, if needed.
-type Middleware func(HandlerFunction) HandlerFunction
+// UpdateHandler is a function for middlewares
+type UpdateHandler func(*Update)
 
-var createBot = func(token string, httpClient *http.Client) (adapter.BotAdapter, error) {
-	return adapter.CreateBot(token, httpClient)
-}
+// Middleware is a middleware for updates
+type Middleware func(UpdateHandler) UpdateHandler
 
-// ServerOption is a functional option for Server
+// ServerOption type for additional Server options
 type ServerOption func(*Server)
+
+type handlerFunc func(*Message)
+
+type messageHandler struct {
+	rx *regexp.Regexp
+	f  handlerFunc
+}
+
+/*
+New creates new Server. Available options:
+	WithWebook(url, addr string)
+	WithHTTPClient(client *http.Client)
+*/
+func New(token string, options ...ServerOption) *Server {
+	s := &Server{
+		httpClient: http.DefaultClient,
+		token:      token,
+		logger:     nopLogger{},
+
+		editMessageHandler:     func(*Message) {},
+		channelPostHandler:     func(*Message) {},
+		editChannelPostHandler: func(*Message) {},
+		inlineQueryHandler:     func(*InlineQuery) {},
+		inlineResultHandler:    func(*ChosenInlineResult) {},
+		callbackHandler:        func(*CallbackQuery) {},
+		shippingHandler:        func(*ShippingQuery) {},
+		preCheckoutHandler:     func(*PreCheckoutQuery) {},
+		pollHandler:            func(*Poll) {},
+	}
+	for _, opt := range options {
+		opt(s)
+	}
+	// bot, err :=  tgbotapi.NewBotAPIWithClient(token, s.httpClient)
+	s.client = NewClient(token, s.httpClient, apiBaseURL)
+	return s
+}
 
 // WithWebhook returns ServerOption for given Webhook URL and Server address to listen.
 // e.g. WithWebook("https://bot.example.com/super/url", "0.0.0.0:8080")
-func WithWebhook(url string, addr string) ServerOption {
+func WithWebhook(url, addr string) ServerOption {
 	return func(s *Server) {
 		s.webhookURL = url
 		s.listenAddr = addr
 	}
 }
 
-// WithMux sets custom mux for server. Should satisfy Mux interface.
-func WithMux(m Mux) ServerOption {
-	return func(s *Server) {
-		s.mux = m
-	}
-}
-
-// WithHttpClient sets custom http client for server.
-func WithHttpClient(client *http.Client) ServerOption {
+// WithHTTPClient sets custom http client for server.
+func WithHTTPClient(client *http.Client) ServerOption {
 	return func(s *Server) {
 		s.httpClient = client
 	}
 }
 
-// NewServer creates new Server with Telegram API Token
-// and default /help handler using go default http client
-func NewServer(token string, options ...ServerOption) (*Server, error) {
-	server := &Server{
-		mux:        NewDefaultMux(),
-		httpClient: http.DefaultClient,
+// WithLogger sets logger for tbot
+func WithLogger(logger Logger) ServerOption {
+	return func(s *Server) {
+		s.logger = logger
 	}
-
-	for _, option := range options {
-		option(server)
-	}
-
-	tbot, err := createBot(token, server.httpClient)
-	if err != nil {
-		return nil, err
-	}
-	server.bot = tbot
-
-	server.HandleFunc("/help", server.HelpHandler)
-
-	return server, nil
 }
 
-// AddMiddleware adds new Middleware for server
-func (s *Server) AddMiddleware(mid Middleware) {
-	s.middlewares = append(s.middlewares, mid)
+// Use adds middleware to server
+func (s *Server) Use(m Middleware) {
+	s.middlewares = append(s.middlewares, m)
 }
 
-// ListenAndServe starts Server, returns error on failure
-func (s *Server) ListenAndServe() error {
-	updates, err := s.bot.GetUpdatesChan(s.webhookURL, s.listenAddr)
+// Start listening for updates
+func (s *Server) Start() error {
+	if len(s.token) == 0 {
+		return fmt.Errorf("token is empty")
+	}
+	updates, err := s.getUpdates()
 	if err != nil {
 		return err
 	}
-	for update := range updates {
-		go s.processMessage(&Message{Message: update})
+	for {
+		select {
+		case update := <-updates:
+			handleUpdate := func(update *Update) {
+				switch {
+				case update.Message != nil:
+					s.handleMessage(update.Message)
+				case update.EditedMessage != nil:
+					s.editMessageHandler(update.EditedMessage)
+				case update.ChannelPost != nil:
+					s.channelPostHandler(update.ChannelPost)
+				case update.EditedChannelPost != nil:
+					s.editChannelPostHandler(update.EditedChannelPost)
+				case update.InlineQuery != nil:
+					s.inlineQueryHandler(update.InlineQuery)
+				case update.ChosenInlineResult != nil:
+					s.inlineResultHandler(update.ChosenInlineResult)
+				case update.CallbackQuery != nil:
+					s.callbackHandler(update.CallbackQuery)
+				case update.ShippingQuery != nil:
+					s.shippingHandler(update.ShippingQuery)
+				case update.PreCheckoutQuery != nil:
+					s.preCheckoutHandler(update.PreCheckoutQuery)
+				case update.Poll != nil:
+					s.pollHandler(update.Poll)
+				}
+			}
+			var f = handleUpdate
+			for i := len(s.middlewares) - 1; i >= 0; i-- {
+				f = s.middlewares[i](f)
+			}
+			go f(update)
+		case <-s.stop:
+			return nil
+		}
 	}
-	return nil
 }
 
-// HandleFunc delegates HandleFunc to the current Mux
-func (s *Server) HandleFunc(path string, handler HandlerFunction, description ...string) {
-	s.mux.HandleFunc(path, handler, description...)
+// Client returns Telegram API Client
+func (s *Server) Client() *Client {
+	return s.client
 }
 
-// Handle is a shortcut for HandleFunc to reply just with static text,
-// "description" is for "/help" handler.
-func (s *Server) Handle(path string, reply string, description ...string) {
-	f := func(m *Message) {
-		m.Reply(reply)
+// Stop listening for updates
+func (s *Server) Stop() {
+	s.stop <- struct{}{}
+}
+
+func (s *Server) getUpdates() (chan *Update, error) {
+	if s.webhookURL != "" && s.listenAddr != "" {
+		return s.listenUpdates()
 	}
-	s.HandleFunc(path, f, description...)
+	s.client.deleteWebhook()
+	return s.longPoolUpdates()
 }
 
-// HandleFile adds file handler for user uploads.
-func (s *Server) HandleFile(handler HandlerFunction, description ...string) {
-	s.mux.HandleFile(handler, description...)
+func (s *Server) listenUpdates() (chan *Update, error) {
+	err := s.client.setWebhook(s.webhookURL)
+	if err != nil {
+		return nil, fmt.Errorf("unable to set webhook: %v", err)
+	}
+	updates := make(chan *Update)
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		up := &Update{}
+		err := json.NewDecoder(r.Body).Decode(up)
+		if err != nil {
+			s.logger.Errorf("unable to decode update: %v", err)
+			return
+		}
+		updates <- up
+	}
+	l, err := net.Listen("tcp", s.listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	go http.Serve(l, http.HandlerFunc(handler))
+	return updates, nil
 }
 
-// HandleDefault delegates HandleDefault to the current Mux
-func (s *Server) HandleDefault(handler HandlerFunction, description ...string) {
-	s.mux.HandleDefault(handler, description...)
+func (s *Server) longPoolUpdates() (chan *Update, error) {
+	s.logger.Debugf("fetching updates...")
+	endpoint := fmt.Sprintf("%s/bot%s/%s", apiBaseURL, s.token, "getUpdates")
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	params := s.updatesParams
+	if params == nil {
+		params = url.Values{}
+	}
+	params.Set("timeout", fmt.Sprint(3600))
+	req.URL.RawQuery = params.Encode()
+	updates := make(chan *Update, s.bufferSize)
+	go func() {
+		for {
+			params.Set("offset", fmt.Sprint(s.nextOffset))
+			req.URL.RawQuery = params.Encode()
+			resp, err := s.httpClient.Do(req)
+			if err != nil {
+				s.logger.Errorf("unable to perform request: %v", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			var updatesResp *struct {
+				OK          bool      `json:"ok"`
+				Result      []*Update `json:"result"`
+				Description string    `json:"description"`
+			}
+			err = json.NewDecoder(resp.Body).Decode(&updatesResp)
+			if err != nil {
+				s.logger.Errorf("unable to decode response: %v", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			err = resp.Body.Close()
+			if err != nil {
+				s.logger.Errorf("unable to close response body: %v", err)
+			}
+			if !updatesResp.OK {
+				s.logger.Errorf("updates query fail: %s", updatesResp.Description)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			for _, up := range updatesResp.Result {
+				s.nextOffset = up.UpdateID + 1
+				updates <- up
+			}
+		}
+	}()
+	return updates, nil
 }
 
-func (s *Server) SetAlias(route string, aliases ...string) {
-	s.mux.SetAlias(route, aliases...)
+// HandleMessage sets handler for incoming messages
+func (s *Server) HandleMessage(pattern string, handler func(*Message)) {
+	rx := regexp.MustCompile(pattern)
+	s.messageHandlers = append(s.messageHandlers, messageHandler{rx: rx, f: handler})
 }
 
-func (s *Server) Send(chatID int64, text string) error {
-	return s.bot.Send(&model.Message{Type: model.MessageText, ChatID: chatID, Data: text})
+// HandleEditedMessage set handler for incoming edited messages
+func (s *Server) HandleEditedMessage(handler func(*Message)) {
+	s.editMessageHandler = handler
 }
 
-// SendMessage method sends a Message object to the user.
-// MessageType and ChatID are required for sending a proper message to a chat.
-func (s *Server) SendMessage(m *model.Message) error {
-	return s.bot.Send(m)
+// HandleChannelPost set handler for incoming channel post
+func (s *Server) HandleChannelPost(handler func(*Message)) {
+	s.channelPostHandler = handler
 }
 
-// SendRaw sends direct request to telegram api
-func (s *Server) SendRaw(endpoint string, params map[string]string) error {
-	return s.bot.SendRaw(endpoint, params)
+// HandleEditChannelPost set handler for incoming edited channel post
+func (s *Server) HandleEditChannelPost(handler func(*Message)) {
+	s.editChannelPostHandler = handler
 }
 
-func (s *Server) Reset(chatID int64) {
-	s.mux.Reset(chatID)
+// HandleInlineQuery set handler for inline queries
+func (s *Server) HandleInlineQuery(handler func(*InlineQuery)) {
+	s.inlineQueryHandler = handler
+}
+
+// HandleInlineResult set inline result handler
+func (s *Server) HandleInlineResult(handler func(*ChosenInlineResult)) {
+	s.inlineResultHandler = handler
+}
+
+// HandleCallback set handler for inline buttons
+func (s *Server) HandleCallback(handler func(*CallbackQuery)) {
+	s.callbackHandler = handler
+}
+
+// HandleShipping set handler for shipping queries
+func (s *Server) HandleShipping(handler func(*ShippingQuery)) {
+	s.shippingHandler = handler
+}
+
+// HandlePreCheckout set handler for pre-checkout queries
+func (s *Server) HandlePreCheckout(handler func(*PreCheckoutQuery)) {
+	s.preCheckoutHandler = handler
+}
+
+// HandlePollUpdate set handler for native poll updates
+func (s *Server) HandlePollUpdate(handler func(*Poll)) {
+	s.pollHandler = handler
+}
+
+func (s *Server) handleMessage(msg *Message) {
+	for _, handler := range s.messageHandlers {
+		if handler.rx.MatchString(msg.Text) {
+			handler.f(msg)
+			return
+		}
+	}
 }
